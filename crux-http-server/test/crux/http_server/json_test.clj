@@ -69,6 +69,7 @@
              (set (json-get {:url "/_crux/query"
                              :qps {"queryEdn" (pr-str '{:find [e]
                                                         :where [[e :crux.db/id]]})}}))))
+    (Thread/sleep 5) ;; wait for asynchronous bus event to update `!running-queries` in `crux.node`
     (t/is (= (pr-str '{:find [e]
                        :where [[e :crux.db/id]]})
              (-> (json-get {:url "/_crux/recent-queries"})
