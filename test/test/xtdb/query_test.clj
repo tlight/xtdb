@@ -6,6 +6,7 @@
             [xtdb.fixtures :as fix :refer [*api*]]
             [xtdb.fixtures.tpch :as tpch]
             [xtdb.index :as idx]
+            [xtdb.io :as xio]
             [xtdb.query :as q]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -4153,3 +4154,13 @@
                                      {:with-docs? true, :with-corrections? true
                                       :start-tx {::xt/tx-time (Date. (dec (.getTime tx-time)))}})
                   (map #(select-keys % [::xt/tx-id ::xt/doc])))))))
+
+(t/deftest external-sort-test
+  (with-redefs [xio/default-external-sort-part-size 1024]
+    (fix/submit+await-tx (for [i (range 1025)]
+                           [::xt/put {:xt/id i, :some/data i}]))
+    (t/is (= (mapv vector (range 1025))
+             (xt/q (xt/db *api*)
+                   '{:find [i]
+                     :where [[?e :some/data i]]
+                     :order-by [[i :asc]]})))))
