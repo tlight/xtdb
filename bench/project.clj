@@ -39,7 +39,11 @@
 
                  ;; cloudwatch metrics deps
                  [io.github.azagniotov/dropwizard-metrics-cloudwatch "2.0.8" :exclusions [io.netty/netty-transport-native-unix-common]]
-                 [software.amazon.awssdk/cloudwatch "2.19.21" :exclusions [io.netty/netty-transport-native-unix-common]]]
+                 [software.amazon.awssdk/cloudwatch "2.19.21" :exclusions [io.netty/netty-transport-native-unix-common]]
+
+                 ;; for extra bench measurement
+                 [io.micrometer/micrometer-core "1.9.5"]
+                 [com.github.oshi/oshi-core "6.3.0"]]
 
   :resource-paths ["resources" "data"]
   :jvm-opts ["-Xms3g" "-Xmx3g"]
