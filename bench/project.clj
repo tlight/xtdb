@@ -41,7 +41,8 @@
                  [io.github.azagniotov/dropwizard-metrics-cloudwatch "2.0.8" :exclusions [io.netty/netty-transport-native-unix-common]]
                  [software.amazon.awssdk/cloudwatch "2.19.21" :exclusions [io.netty/netty-transport-native-unix-common]]
 
-                 ;; for extra bench measurement
+                 ;; bench 2 (will likely be externalised as a lib)
+                 [com.google.guava/guava "30.1.1-jre"]
                  [io.micrometer/micrometer-core "1.9.5"]
                  [com.github.oshi/oshi-core "6.3.0"]]
 
