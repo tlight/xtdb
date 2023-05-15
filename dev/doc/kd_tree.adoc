@@ -8,7 +8,8 @@ on the temporal data.
 https://en.wikipedia.org/wiki/K-d_tree[Wikipedia] has good page on kd-trees, we suggest that
 , if you have not already, have a look at that first.
 In short KD-trees store points (with a fixed number of dimensions)
-and let you query for those points efficiently. It achieves this by building a tree where on
+and let you query (by providing sub-ranges in (potentially) several dimensions) for those points efficiently.
+It achieves this by building a tree where on
 every internal node the points are partitioned according to some dimension. In our case the points
 are made up temporal data + some connection to the content.
 
@@ -40,6 +41,7 @@ After the first transaction the kd-tree would contain the point (according to th
 [1 2 "2021" "2023" "2021" "+inf"] ;; new version
 [1 1 "2023+" "+inf" "2021" "+inf"] ;; old version, second vaild part interval
 ----
+
 Beware that the tree does not store the data in the format above (that's just for illustration) but rather
 as 64-bit longs. The dimensions might also not appear in this order. The order is quite important
 as a highly selective dimension coming earlier is better. This is even more important for the grid
@@ -58,7 +60,59 @@ When querying the tree one specifies a min and a max point. It then returns all 
 the range of that dimension specified by min and max. For example:
 [source,clojure]
 ----
-[1 "-inf" "-inf" "2023" "-inf" "2023"] ;; min
-[1 "+inf" "2020" "+inf" "2023+" "+inf"] ;; max
+[1 "-inf" "-inf" "2020+" "-inf" "2023"] ;; min
+[1 "+inf" "2023-" "+inf" "+inf" "+inf"] ;; max
 ----
 Would return all versions of entity `1` which are valid between 2020 and 2023 looking at the database in 2023.
+
+The leaves of the KD-tree store the actually coordinates in an arrow `FixedSizeListVector`. These coordinates get
+recycled with a java.lang.ref.Cleaner (see the kd_tree.clj for details) mechansim. Arrow vectors can be nulled
+even if there is still data at that position. This has the special meaning of a delete (more on this below).
+
+=== Temporal update
+
+Let us walk through a temporal update with the example of the
+second transaction `[:put :foo {:xt/id 1 :bar 2} {:for-valid-time ["2021" "2023"]}]`.
+The temporal coordinate for that put is `[1 2 "2021" "2023" "2021" "+inf"]`. We would then
+query for overlapping entity versions (this step can be skipped if we know that we are dealing with a new entity).
+The min and max range coordinates would then look as follows:
+[source,clojure]
+----
+[1 "-inf" "-inf" "2021+" "-inf" "2021"] ;; min
+[1 "+inf" "2023-" "+inf" "+inf" "+inf"] ;; max
+----
+The restriction on `iid` is because we are only interested in entity id `1`. We don't know anything about the
+row-ids of that entity so we are not filtering anything (second column). We are interested in versions that
+have a `valid-time-start` before 2023 (third column) and are `valid-time-end` at least a bit after 2021 (fourth column.
+We need those columns to be valid in system-time after 2021 (fifth and sixth column).
+
+We then get back a set of points which intersect with the new update (`[1 1 "2020" "+inf" "2020" "+inf"]`)
+This coordinate is no longer valid after our update. It needs to have it's system-time updated to `2021`.
+In practice this means we delete the coordinate and insert a new one (`[1 1 "2020" "+inf" "2020" "2021"]`).
+
+The second thing that can happen is that the valid-times of the returned coordinates do not strictly lie within
+the valid-time of the new version. In that case we need to potentially add two new coordinates (one if there is a valid-time
+part that comes before the new version and one that comes after) to the tree.
+This is the case in our example. So we need to add the following two updates as well.
+
+[source,clojure]
+----
+[1 1 "2020" "-2021" "2021" "+inf"] ;; old version, first valid part interval
+[1 1 "2023+" "+inf" "2021" "+inf"] ;; old version, second vaild part interval
+----
+
+=== Ingestion process
+
+The above temporal update happens on the KD-tree in memory. Once a chunk is finished (~1e5 row-ids) the kd-tree gets
+flushed to the grid (on disk). The grid does not support the update/insert operations. The grid is one file so a
+KD-tree flush triggers a build of a new grid file (which is done in some background thread).
+There is the notion of a `MergedKDTree` where one part is static (grid) and the other is dynamic (in-memory).
+Search operations on this structure just branch off to both grid and kd-tree. Update and insert operations are only
+done on the KD-tree. It might be that the `MergeKDTree` has multiple levels of grid. This happens if the merging of
+the single grid-file has not finished yet and there are still only multiple flushed grid files available.
+
+One issue that arises from this is that one can not update/delete on the grid part of the whole KD-tree. Imagine the case
+where we get the second `put` above in some chunk but the first `put` is in some earlier chunk already in the grid.
+For that we store a `delete` in the dynamic part (kd-tree). When searching for coordinates the deletes in the
+kd-tree filter out the coordinates coming from the grid. These deletes are stored normally in the underlying
+Arrow Vector, but marked via nulling that index.
