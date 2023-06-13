@@ -1,6 +1,7 @@
 (ns xtdb.operator.scan
   (:require [clojure.set :as set]
             [clojure.spec.alpha :as s]
+            [clojure.string :as str]
             [juxt.clojars-mirrors.integrant.core :as ig]
             [xtdb.bloom :as bloom]
             [xtdb.buffer-pool :as bp]
@@ -10,30 +11,31 @@
             [xtdb.expression.walk :as expr.walk]
             [xtdb.logical-plan :as lp]
             [xtdb.metadata :as meta]
+            xtdb.object-store
             [xtdb.temporal :as temporal]
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector :as vec]
             [xtdb.vector.indirect :as iv]
             xtdb.watermark)
-  (:import (clojure.lang IPersistentSet MapEntry)
-           (java.util HashMap LinkedList List Map Queue Set)
-           (java.util.function BiFunction Consumer)
-           java.util.stream.IntStream
-           org.apache.arrow.memory.BufferAllocator
+  (:import (clojure.lang MapEntry)
+           (java.util ArrayList Map Set)
+           (java.util.function Consumer)
+           (org.apache.arrow.memory ArrowBuf BufferAllocator)
+           (org.apache.arrow.vector BigIntVector VectorSchemaRoot)
            (org.apache.arrow.vector BigIntVector VarBinaryVector)
+           (org.apache.arrow.vector.complex DenseUnionVector ListVector StructVector)
            (org.apache.arrow.vector.complex ListVector StructVector)
            (org.roaringbitmap IntConsumer RoaringBitmap)
            org.roaringbitmap.buffer.MutableRoaringBitmap
-           (org.roaringbitmap.longlong Roaring64Bitmap)
            xtdb.api.protocols.TransactionInstant
            xtdb.buffer_pool.IBufferPool
            xtdb.ICursor
-           xtdb.live_chunk.ILiveTableWatermark
            (xtdb.metadata IMetadataManager ITableMetadata)
+           (xtdb.object_store ObjectStore)
            xtdb.operator.IRelationSelector
            (xtdb.vector IIndirectRelation IIndirectVector)
-           (xtdb.watermark Watermark IWatermark IWatermarkSource)))
+           (xtdb.watermark IWatermark IWatermarkSource)))
 
 (s/def ::table symbol?)
 
@@ -88,66 +90,6 @@
                    filtered-block-idxs)))))))
     block-idxs))
 
-(deftype ContentChunkCursor [^BufferAllocator allocator
-                             ^IMetadataManager metadata-mgr
-                             ^IBufferPool buffer-pool
-                             table-name content-col-names
-                             ^Queue matching-chunks
-                             ^ICursor current-cursor]
-  ICursor #_<IIR>
-  (tryAdvance [this c]
-    (loop []
-      (or (when current-cursor
-            (or (.tryAdvance current-cursor
-                             (reify Consumer
-                               (accept [_ in-root]
-                                 (.accept c (-> (iv/<-root in-root)
-                                                (iv/with-absent-cols allocator content-col-names))))))
-                (do
-                  (util/try-close current-cursor)
-                  (set! (.-current-cursor this) nil)
-                  false)))
-
-          (if-let [{:keys [chunk-idx block-idxs col-names]} (.poll matching-chunks)]
-            (if-let [block-idxs (reduce (fn [block-idxs col-name]
-                                          (or (->> block-idxs
-                                                   (filter-pushdown-bloom-block-idxs metadata-mgr chunk-idx table-name col-name))
-                                              (reduced nil)))
-                                        block-idxs
-                                        content-col-names)]
-
-              (do
-                (set! (.current-cursor this)
-                      (->> (for [col-name (set/intersection col-names content-col-names)]
-                             (-> (.getBuffer buffer-pool (meta/->chunk-obj-key chunk-idx table-name col-name))
-                                 (util/then-apply
-                                   (fn [buf]
-                                     (MapEntry/create col-name
-                                                      (util/->chunks buf {:block-idxs block-idxs, :close-buffer? true}))))))
-                           (remove nil?)
-                           vec
-                           (into {} (map deref))
-                           (util/rethrowing-cause)
-                           (util/combine-col-cursors)))
-
-                (recur))
-
-              (recur))
-
-            false))))
-
-  (close [_]
-    (some-> current-cursor util/try-close)))
-
-(defn- ->content-chunks ^xtdb.ICursor [^BufferAllocator allocator
-                                        ^IMetadataManager metadata-mgr
-                                        ^IBufferPool buffer-pool
-                                        table-name content-col-names
-                                        metadata-pred]
-  (ContentChunkCursor. allocator metadata-mgr buffer-pool table-name content-col-names
-                       (LinkedList. (or (meta/matching-chunks metadata-mgr table-name metadata-pred) []))
-                       nil))
-
 (defn- roaring-and
   (^org.roaringbitmap.RoaringBitmap [] (RoaringBitmap.))
   (^org.roaringbitmap.RoaringBitmap [^RoaringBitmap x] x)
@@ -155,106 +97,11 @@
    (doto x
      (.and y))))
 
-(defn- ->atemporal-row-id-bitmap [^BufferAllocator allocator, ^Map col-preds, ^IIndirectRelation in-rel, params]
-  (let [row-id-rdr (-> (.vectorForName in-rel "_row_id")
-                       (.monoReader :i64))
-        res (Roaring64Bitmap.)]
-
-    (if-let [content-col-preds (seq (remove (comp temporal/temporal-column? util/str->normal-form-str str key) col-preds))]
-      (let [^RoaringBitmap
-            idx-bitmap (->> (for [^IRelationSelector col-pred (vals content-col-preds)]
-                              (RoaringBitmap/bitmapOf (.select col-pred allocator in-rel params)))
-                            (reduce roaring-and))]
-        (.forEach idx-bitmap
-                  (reify org.roaringbitmap.IntConsumer
-                    (accept [_ idx]
-                      (.addLong res (.readLong row-id-rdr idx))))))
-
-      (dotimes [idx (.valueCount row-id-rdr)]
-        (.addLong res (.readLong row-id-rdr idx))))
-
-    res))
-
-(defn- adjust-temporal-min-range-to-row-id-range ^longs [^longs temporal-min-range ^Roaring64Bitmap row-id-bitmap]
-  (let [temporal-min-range (or (temporal/->copy-range temporal-min-range) (temporal/->min-range))]
-    (if (.isEmpty row-id-bitmap)
-      temporal-min-range
-      (let [min-row-id (.select row-id-bitmap 0)]
-        (doto temporal-min-range
-          (aset temporal/row-id-idx
-                (max min-row-id (aget temporal-min-range temporal/row-id-idx))))))))
-
-(defn- adjust-temporal-max-range-to-row-id-range ^longs [^longs temporal-max-range ^Roaring64Bitmap row-id-bitmap]
-  (let [temporal-max-range (or (temporal/->copy-range temporal-max-range) (temporal/->max-range))]
-    (if (.isEmpty row-id-bitmap)
-      temporal-max-range
-      (let [max-row-id (.select row-id-bitmap (dec (.getLongCardinality row-id-bitmap)))]
-        (doto temporal-max-range
-          (aset temporal/row-id-idx
-                (min max-row-id (aget temporal-max-range temporal/row-id-idx))))))))
-
-(defn- select-current-row-ids ^xtdb.vector.IIndirectRelation [^IIndirectRelation content-rel, ^Roaring64Bitmap atemporal-row-id-bitmap, ^IPersistentSet current-row-ids]
-  (let [sel (IntStream/builder)
-        row-id-rdr (-> (.vectorForName content-rel "_row_id")
-                       (.monoReader :i64))]
-    (dotimes [idx (.rowCount content-rel)]
-      (let [row-id (.readLong row-id-rdr idx)]
-        (when (and (.contains atemporal-row-id-bitmap row-id)
-                   (.contains current-row-ids row-id))
-          (.add sel idx))))
-
-    (iv/select content-rel (.toArray (.build sel)))))
-
-(defn- ->temporal-rel ^xtdb.vector.IIndirectRelation [^IWatermark watermark, ^BufferAllocator allocator, ^List col-names ^longs temporal-min-range ^longs temporal-max-range atemporal-row-id-bitmap]
-  (let [temporal-min-range (adjust-temporal-min-range-to-row-id-range temporal-min-range atemporal-row-id-bitmap)
-        temporal-max-range (adjust-temporal-max-range-to-row-id-range temporal-max-range atemporal-row-id-bitmap)]
-    (.createTemporalRelation (.temporalRootsSource watermark)
-                             allocator
-                             (->> (conj col-names "_row_id")
-                                  (into [] (comp (distinct) (filter temporal/temporal-column?))))
-                             temporal-min-range
-                             temporal-max-range
-                             atemporal-row-id-bitmap)))
-
-(defn- apply-temporal-preds ^xtdb.vector.IIndirectRelation [^IIndirectRelation temporal-rel, ^BufferAllocator allocator, ^Map col-preds, params]
-  (->> (for [^IIndirectVector col temporal-rel
-             :let [col-pred (get col-preds (.getName col))]
-             :when col-pred]
-         col-pred)
-       (reduce (fn [^IIndirectRelation temporal-rel, ^IRelationSelector col-pred]
-                 (-> temporal-rel
-                     (iv/select (.select col-pred allocator temporal-rel params))))
-               temporal-rel)))
-
-(defn- ->row-id->repeat-count ^java.util.Map [^IIndirectVector row-id-col]
-  (let [res (HashMap.)
-        row-id-rdr (.monoReader row-id-col :i64)]
-    (dotimes [idx (.getValueCount row-id-col)]
-      (let [row-id (.readLong row-id-rdr idx)]
-        (.compute res row-id (reify BiFunction
-                               (apply [_ _k v]
-                                 (if v
-                                   (inc (long v))
-                                   1))))))
-    res))
-
-(defn align-vectors ^xtdb.vector.IIndirectRelation [^IIndirectRelation content-rel, ^IIndirectRelation temporal-rel]
-  ;; assumption: temporal-rel is sorted by row-id
-  (let [temporal-row-id-col (.vectorForName temporal-rel "_row_id")
-        content-row-id-rdr (-> (.vectorForName content-rel "_row_id")
-                               (.monoReader :i64))
-        row-id->repeat-count (->row-id->repeat-count temporal-row-id-col)
-        sel (IntStream/builder)]
-    (assert temporal-row-id-col)
-
-    (dotimes [idx (.valueCount content-row-id-rdr)]
-      (let [row-id (.readLong content-row-id-rdr idx)]
-        (when-let [ns (.get row-id->repeat-count row-id)]
-          (dotimes [_ ns]
-            (.add sel idx)))))
-
-    (iv/->indirect-rel (concat temporal-rel
-                               (iv/select content-rel (.toArray (.build sel)))))))
+(defn- col-pred-selection ^longs [^BufferAllocator allocator, ^Map col-preds, ^IIndirectRelation in-rel, params]
+  (->> (for [^IRelationSelector col-pred (vals col-preds)]
+         (RoaringBitmap/bitmapOf (.select col-pred allocator in-rel params)))
+       ^RoaringBitmap (reduce roaring-and (RoaringBitmap/bitmapOfRange 0 (.rowCount in-rel)))
+       (.toArray)))
 
 (defn- remove-col ^xtdb.vector.IIndirectRelation [^IIndirectRelation rel, ^String col-name]
   (iv/->indirect-rel (remove #(= col-name (.getName ^IIndirectVector %)) rel)
@@ -267,48 +114,97 @@
               (.withName col-name)))
         col-names)))
 
+(defn- ->t1-cursor ^xtdb.ICursor [^ObjectStore obj-store, ^IBufferPool buffer-pool
+                                  ^String table-name, content-col-names, temporal-col-names
+                                  ^longs _temporal-min-range, ^longs _temporal-max-range]
+  ;; TODO Path rather than String in the OS/BP?
+  (let [t1-directory-key (first (.listObjects obj-store (format "tables/%s/t1-directory" table-name)))
+        block-idxs (RoaringBitmap.)]
+    (with-open [^ArrowBuf buf @(.getBuffer buffer-pool t1-directory-key)
+                chunks (util/->chunks buf)]
+      (.tryAdvance chunks
+                   (reify Consumer
+                     (accept [_ dir-root]
+                       ;; TODO use readers here
+                       (let [^VectorSchemaRoot dir-root dir-root
+
+                             node-trie-el-vec (-> ^ListVector (.getVector dir-root "node-trie")
+                                                  ^DenseUnionVector (.getDataVector))
+
+                             ^StructVector leaf-vec (.getVectorByType node-trie-el-vec 2)
+                             ^BigIntVector page-idx-vec (.getChild leaf-vec "page-idx")]
+                         (dotimes [n (.getValueCount node-trie-el-vec)]
+                           (let [offset (.getOffset node-trie-el-vec n)]
+                             ;; TODO check metadata
+                             ;; TODO use temporal min/max range
+                             ;; TODO `filter-pushdown-bloom-block-idxs`
+                             ;; TODO limit to EID branches when we have an EID filter.
+                             (case (.getTypeId node-trie-el-vec n)
+                               2 (.add block-idxs (.get page-idx-vec offset))
+                               nil))))))))
+
+    (let [t1-file-name (last (str/split t1-directory-key #"/"))
+          content-cursors (ArrayList.)]
+      ;; TODO get the buffer-pool to give us slices instead - it might want to partially download them
+
+      (try
+        (doseq [col-name content-col-names]
+          (.add content-cursors
+                (-> @(.getBuffer buffer-pool (format "tables/%s/t1-content/%s/%s"
+                                                     table-name col-name t1-file-name))
+                    (util/->chunks {:block-idxs block-idxs, :close-buffer? true}))))
+
+        (let [temporal-cursor (-> @(.getBuffer buffer-pool (format "tables/%s/t1-temporal/%s"
+                                                                   table-name t1-file-name))
+                                  (util/->chunks {:block-idxs block-idxs, :close-buffer? true}))]
+          (try
+            (let [cursor (util/combine-col-cursors (conj (vec content-cursors) temporal-cursor))]
+              (reify ICursor
+                (tryAdvance [_ c]
+                  (.tryAdvance cursor
+                               (reify Consumer
+                                 (accept [_ in-root]
+                                   (let [^VectorSchemaRoot in-root in-root]
+                                     (.accept c (iv/->indirect-rel
+                                                 (for [^String col-name (set/union content-col-names temporal-col-names)
+                                                       :let [col-name (util/str->normal-form-str col-name)]]
+                                                   (iv/->direct-vec (.getVector in-root col-name)))
+                                                 (.getRowCount in-root))))))))
+                (close [_]
+                  (.close cursor))))
+
+            (catch Throwable t
+              (.close temporal-cursor)
+              (throw t))))
+
+        (catch Throwable t
+          (run! util/try-close content-cursors)
+          (throw t))))))
+
 (deftype ScanCursor [^BufferAllocator allocator
-                     ^IMetadataManager metadata-manager
-                     ^IWatermark watermark
-                     ^Set content-col-names
-                     ^Set temporal-col-names
-                     ^Map col-preds
+                     ^Set col-names, ^Map col-preds
                      ^longs temporal-min-range
                      ^longs temporal-max-range
-                     ^IPersistentSet current-row-ids
                      ^ICursor #_<IIR> blocks
                      params]
   ICursor
   (tryAdvance [_ c]
-    (let [keep-row-id-col? (contains? temporal-col-names "_row_id")
-          !advanced? (volatile! false)
-          normalized-temporal-col-names (into #{} (map util/str->normal-form-str) temporal-col-names)]
+    (let [keep-row-id-col? (contains? col-names "_row_id")
+          !advanced? (volatile! false)]
 
       (while (and (not @!advanced?)
                   (.tryAdvance blocks
                                (reify Consumer
-                                 (accept [_ content-rel]
-                                   (let [content-rel (unnormalize-column-names content-rel content-col-names)
-                                         atemporal-row-id-bitmap (->atemporal-row-id-bitmap allocator col-preds content-rel params)]
-                                     (letfn [(accept-rel [^IIndirectRelation read-rel]
-                                               (when (and read-rel (pos? (.rowCount read-rel)))
-                                                 (let [read-rel (cond-> read-rel
-                                                                  (not keep-row-id-col?) (remove-col "_row_id"))]
-                                                   (.accept c read-rel)
-                                                   (vreset! !advanced? true))))]
-                                       (if current-row-ids
-                                         (accept-rel (-> content-rel
-                                                         (select-current-row-ids atemporal-row-id-bitmap current-row-ids)))
-
-                                         (let [temporal-rel (->temporal-rel watermark allocator normalized-temporal-col-names
-                                                                            temporal-min-range temporal-max-range atemporal-row-id-bitmap)]
-                                           (try
-                                             (let [temporal-rel (-> temporal-rel
-                                                                    (unnormalize-column-names (conj temporal-col-names "_row_id"))
-                                                                    (apply-temporal-preds allocator col-preds params))]
-                                               (accept-rel (align-vectors content-rel temporal-rel)))
-                                             (finally
-                                               (util/try-close temporal-rel))))))))))))
+                                 (accept [_ rel]
+                                   (letfn [(accept-rel [^IIndirectRelation read-rel]
+                                             (when (and read-rel (pos? (.rowCount read-rel)))
+                                               (let [read-rel (cond-> read-rel
+                                                                (not keep-row-id-col?) (remove-col "_row_id"))]
+                                                 (.accept c read-rel)
+                                                 (vreset! !advanced? true))))]
+                                     (accept-rel (cond-> (-> rel
+                                                             (unnormalize-column-names col-names))
+                                                   (seq col-preds) (iv/select (col-pred-selection allocator col-preds rel params))))))))))
       (boolean @!advanced?)))
 
   (close [_]
@@ -395,43 +291,34 @@
 
     [min-range max-range]))
 
-(defn- scan-op-at-now [scan-op]
-  (= :now (first (second scan-op))))
-
-(defn- at-now? [{:keys [for-valid-time for-system-time]}]
-  (and (or (nil? for-valid-time)
-           (scan-op-at-now for-valid-time))
-       (or (nil? for-system-time)
-           (scan-op-at-now for-system-time))))
-
-(defn use-current-row-id-cache? [^IWatermark watermark scan-opts basis temporal-col-names]
-  (and
-   (.txBasis watermark)
-   (= (:tx basis)
-      (.txBasis watermark))
-   (at-now? scan-opts)
-   (>= (util/instant->micros (:current-time basis))
-       (util/instant->micros (:system-time (:tx basis))))
-   (empty? (remove #(= % "xt$id") temporal-col-names))))
-
-(defn get-current-row-ids [^IWatermark watermark basis]
-  (.getCurrentRowIds
-    ^xtdb.temporal.ITemporalRelationSource
-    (.temporalRootsSource watermark)
-    (util/instant->micros (:current-time basis))))
-
 (defn tables-with-cols [basis ^IWatermarkSource wm-src ^IScanEmitter scan-emitter]
   (let [{:keys [tx, after-tx]} basis
         wm-tx (or tx after-tx)]
-    (with-open [^Watermark wm (.openWatermark wm-src wm-tx)]
+    (with-open [^IWatermark wm (.openWatermark wm-src wm-tx)]
       (.allTableColNames scan-emitter wm))))
 
 (defmethod ig/prep-key ::scan-emitter [_ opts]
   (merge opts
          {:metadata-mgr (ig/ref ::meta/metadata-manager)
+          :object-store (ig/ref :xtdb/object-store)
           :buffer-pool (ig/ref ::bp/buffer-pool)}))
 
-(defmethod ig/init-key ::scan-emitter [_ {:keys [^IMetadataManager metadata-mgr, ^IBufferPool buffer-pool]}]
+;; TODO real col types
+(def foo-tpch-col-types
+  '{[customer c_acctbal] :f64, [customer c_address] :utf8, [customer c_comment] :utf8, [customer c_custkey] :utf8, [customer c_mktsegment] :utf8, [customer c_name] :utf8, [customer c_nationkey] :utf8, [customer c_phone] :utf8, [customer xt$id] :utf8,
+    [lineitem l_comment] :utf8, [lineitem l_commitdate] [:date :day], [lineitem l_discount] :f64, [lineitem l_extendedprice] :f64, [lineitem l_linenumber] :i64, [lineitem l_linestatus] :utf8, [lineitem l_orderkey] :utf8, [lineitem l_partkey] :utf8, [lineitem l_quantity] :f64, [lineitem l_receiptdate] [:date :day], [lineitem l_returnflag] :utf8, [lineitem l_shipdate] [:date :day], [lineitem l_shipinstruct] :utf8, [lineitem l_shipmode] :utf8, [lineitem l_suppkey] :utf8, [lineitem l_tax] :f64, [lineitem xt$id] :utf8,
+    [nation n_comment] :utf8, [nation n_name] :utf8, [nation n_nationkey] :utf8, [nation n_regionkey] :utf8, [nation xt$id] :utf8,
+    [orders o_clerk] :utf8, [orders o_comment] :utf8, [orders o_custkey] :utf8, [orders o_orderdate] [:date :day], [orders o_orderkey] :utf8, [orders o_orderpriority] :utf8, [orders o_orderstatus] :utf8, [orders o_shippriority] :i64, [orders o_totalprice] :f64, [orders xt$id] :utf8,
+    [part p_brand] :utf8 [part p_comment] :utf8, [part p_container] :utf8, [part p_mfgr] :utf8, [part p_name] :utf8, [part p_partkey] :utf8, [part p_retailprice] :f64, [part p_size] :i64, [part p_type] :utf8, [part xt$id] :utf8,
+    [partsupp ps_availqty] :i64, [partsupp ps_comment] :utf8, [partsupp ps_partkey] :utf8, [partsupp ps_suppkey] :utf8, [partsupp ps_supplycost] :f64, [partsupp xt$id] :utf8,
+    [region r_comment] :utf8, [region r_name] :utf8, [region r_regionkey] :utf8, [region xt$id] :utf8,
+    [supplier s_acctbal] :f64, [supplier s_address] :utf8, [supplier s_comment] :utf8, [supplier s_name] :utf8, [supplier s_nationkey] :utf8, [supplier s_phone] :utf8, [supplier s_suppkey] :utf8, [supplier xt$id] :utf8,
+    [xt$txs xt$committed?] :bool, [xt$txs xt$error] [:union #{:clj-form :null}], [xt$txs xt$id] :i64, [xt$txs xt$tx_time] [:timestamp-tz :micro "UTC"],
+    })
+
+(defmethod ig/init-key ::scan-emitter [_ {:keys [^IMetadataManager metadata-mgr
+                                                 ^ObjectStore object-store
+                                                 ^IBufferPool buffer-pool]}]
   (reify IScanEmitter
     (tableColNames [_ wm table-name]
       (let [normalized-table (util/str->normal-form-str table-name)]
@@ -443,17 +330,16 @@
 
     (allTableColNames [_ wm]
       (merge-with
-        set/union
-        (update-vals
-          (.allColumnTypes metadata-mgr)
-          (comp set keys))
-        (update-vals
-          (some-> (.liveChunk wm)
-                  (.allColumnTypes))
-          (comp set keys))))
+       set/union
+       (update-vals
+        (.allColumnTypes metadata-mgr)
+        (comp set keys))
+       (update-vals
+        (some-> (.liveChunk wm)
+                (.allColumnTypes))
+        (comp set keys))))
 
     (scanColTypes [_ wm scan-cols]
-
       (letfn [(->col-type [[table col-name]]
                 (let [normalized-table (util/str->normal-form-str (str table))
                       normalized-col-name (util/str->normal-form-str (str col-name))]
@@ -465,10 +351,15 @@
                                                    (.columnTypes)
                                                    (get normalized-col-name))))))]
         (->> scan-cols
-             (into {} (map (juxt identity ->col-type))))))
+             ;; TODO real scan col types
+             (into {} (map (juxt identity #_->col-type foo-tpch-col-types))))))
 
-    (emitScan [_ {:keys [columns], {:keys [table for-valid-time] :as scan-opts} :scan-opts} scan-col-types param-types]
-      (let [col-names (->> columns
+    (emitScan [_ {:keys [columns], {:keys [table for-valid-time default-all-valid-time?] :as scan-opts} :scan-opts} scan-col-types param-types]
+      (let [scan-opts (cond-> scan-opts
+                        (nil? for-valid-time)
+                        (assoc :for-valid-time (if default-all-valid-time? [:all-time] [:at [:now :now]])))
+
+            col-names (->> columns
                            (into [] (comp (map (fn [[col-type arg]]
                                                  (case col-type
                                                    :column arg
@@ -479,7 +370,10 @@
             {content-col-names false, temporal-col-names true}
             (->> col-names (group-by (comp temporal/temporal-column? util/str->normal-form-str str)))
 
-            content-col-names (-> (set (map str content-col-names)) (conj "_row_id"))
+            content-col-names (-> (set (map str content-col-names))
+                                  ;; TODO reinstate row-id
+                                  #_(conj "_row_id"))
+            #_#_
             normalized-content-col-names (set (map (comp util/str->normal-form-str) content-col-names))
             temporal-col-names (into #{} (map (comp str)) temporal-col-names)
             normalized-table-name (util/str->normal-form-str (str table))
@@ -500,42 +394,75 @@
                                               (expr/->expression-relation-selector select-form {:col-types col-types, :param-types param-types})))
                            (into {}))
 
+            #_#_
             metadata-args (vec (for [[col-name select] selects
                                      :when (not (temporal/temporal-column? (util/str->normal-form-str (str col-name))))]
                                  select))
 
             row-count (->> (meta/with-all-metadata metadata-mgr normalized-table-name
                              (util/->jbifn
-                              (fn [_chunk-idx ^ITableMetadata table-metadata]
-                                (let [id-col-idx (.rowIndex table-metadata "xt$id" -1)
-                                      ^BigIntVector count-vec (-> (.metadataRoot table-metadata)
-                                                                  ^ListVector (.getVector "columns")
-                                                                  ^StructVector (.getDataVector)
-                                                                  (.getChild "count"))]
-                                  (.get count-vec id-col-idx)))))
+                               (fn [_chunk-idx ^ITableMetadata table-metadata]
+                                 (let [id-col-idx (.rowIndex table-metadata "xt$id" -1)
+                                       ^BigIntVector count-vec (-> (.metadataRoot table-metadata)
+                                                                   ^ListVector (.getVector "columns")
+                                                                   ^StructVector (.getDataVector)
+                                                                   (.getChild "count"))]
+                                   (.get count-vec id-col-idx)))))
                            (reduce +))]
 
         {:col-types col-types
          :stats {:row-count row-count}
-         :->cursor (fn [{:keys [allocator, ^IWatermark watermark, basis, params default-all-valid-time?]}]
-                     (let [metadata-pred (expr.meta/->metadata-selector (cons 'and metadata-args) col-types params)
-                           scan-opts (cond-> scan-opts
-                                       (nil? for-valid-time)
-                                       (assoc :for-valid-time (if default-all-valid-time? [:all-time] [:at [:now :now]])))
-                           [temporal-min-range temporal-max-range] (->temporal-min-max-range params basis scan-opts selects)
-                           current-row-ids (when (use-current-row-id-cache? watermark scan-opts basis temporal-col-names)
-                                             (get-current-row-ids watermark basis))]
-                       (-> (ScanCursor. allocator metadata-mgr watermark
-                                        content-col-names temporal-col-names col-preds
-                                        temporal-min-range temporal-max-range current-row-ids
-                                        (util/->concat-cursor (->content-chunks allocator metadata-mgr buffer-pool
-                                                                                normalized-table-name normalized-content-col-names
-                                                                                metadata-pred)
-                                                              (some-> (.liveChunk watermark)
-                                                                      (.liveTable normalized-table-name)
-                                                                      (.liveBlocks normalized-content-col-names metadata-pred)))
+         :->cursor (fn [{:keys [allocator, ^IWatermark watermark, basis, params]}]
+                     ;; TODO use metadata-pred
+                     (let [ ; metadata-pred (expr.meta/->metadata-selector (cons 'and metadata-args) col-types params)
+                           [temporal-min-range temporal-max-range] (->temporal-min-max-range params basis scan-opts selects)]
+
+                       #_  ; TODO use live chunk - here's what was here before
+                       (util/->concat-cursor (->content-chunks allocator metadata-mgr buffer-pool
+                                                               normalized-table-name normalized-content-col-names
+                                                               metadata-pred)
+                                             (some-> (.liveChunk watermark)
+                                                     (.liveTable normalized-table-name)
+                                                     (.liveBlocks normalized-content-col-names metadata-pred)))
+
+                       (-> (ScanCursor. allocator
+                                        (into #{} (map str) col-names) col-preds
+                                        temporal-min-range temporal-max-range
+                                        (->t1-cursor object-store buffer-pool normalized-table-name
+                                                     content-col-names temporal-col-names
+                                                     temporal-min-range temporal-max-range)
                                         params)
                            (coalesce/->coalescing-cursor allocator))))}))))
 
 (defmethod lp/emit-expr :scan [scan-expr {:keys [^IScanEmitter scan-emitter scan-col-types, param-types]}]
   (.emitScan scan-emitter scan-expr scan-col-types param-types))
+
+(comment
+  (do
+    (require '[xtdb.node :as node]
+             '[xtdb.test-util :as tu])
+
+
+
+    (with-open [node (node/start-node {:xtdb.object-store/file-system-object-store {:root-path "/home/james/tmp/idx-poc/tpch-01"}})]
+      (binding [tu/*allocator* (tu/component node :xtdb/allocator)]
+        (tu/query-ra '[:assign [PartSupp [:join [{s_suppkey ps_suppkey}]
+                                          [:join [{n_nationkey s_nationkey}]
+                                           [:join [{n_regionkey r_regionkey}]
+                                            [:scan {:for-valid-time [:at :now] :table nation} [n_name n_regionkey n_nationkey]]
+                                            [:scan {:for-valid-time [:at :now] :table region} [r_regionkey {r_name (= r_name ?region)}]]]
+                                           [:scan {:for-valid-time [:at :now] :table supplier} [s_nationkey s_suppkey s_acctbal s_name s_address s_phone s_comment]]]
+                                          [:scan {:for-valid-time [:at :now] :table partsupp} [ps_suppkey ps_partkey ps_supplycost]]]]
+                       [:top {:limit 100}
+                        [:order-by [[s_acctbal {:direction :desc}] [n_name] [s_name] [p_partkey]]
+                         [:project [s_acctbal s_name n_name p_partkey p_mfgr s_address s_phone s_comment]
+                          [:join [{ps_partkey ps_partkey} {ps_supplycost min_ps_supplycost}]
+                           [:join [{ps_partkey p_partkey}]
+                            PartSupp
+                            [:scan {:for-valid-time [:at :now] :table part} [p_partkey p_mfgr {p_size (= p_size ?size)} {p_type (like p_type "%BRASS")}]]]
+                           [:group-by [ps_partkey {min_ps_supplycost (min ps_supplycost)}]
+                            PartSupp]]]]]]
+                     {:node node
+                      :params {'?region "EUROPE"
+                               ;; '?type "BRASS"
+                               '?size 15}})))))
