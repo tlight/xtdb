@@ -2,14 +2,17 @@
   (:require [clojure.string :as str]
             [xtdb.util :as util]
             [juxt.clojars-mirrors.integrant.core :as ig]
-            [clojure.spec.alpha :as s])
+            [juxt.dirwatch :as dirwatch]
+            [clojure.spec.alpha :as s]
+            [xtdb.file-list :as file-list])
   (:import java.io.Closeable
            java.nio.ByteBuffer
            (java.nio.channels FileChannel$MapMode)
            [java.nio.file CopyOption Files FileSystems FileVisitOption LinkOption OpenOption Path StandardOpenOption]
            [java.util.concurrent CompletableFuture ConcurrentSkipListMap Executors ExecutorService]
            java.util.function.Supplier
-           java.util.NavigableMap))
+           java.util.NavigableMap
+           xtdb.file_list.FileCache))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -128,7 +131,13 @@
 
   )
 
-(deftype FileSystemObjectStore [^Path root-path, ^ExecutorService pool]
+(defn list-files-in-path [root-path]
+  (with-open [dir-stream (Files/walk root-path (make-array FileVisitOption 0))]
+    (vec (sort (for [^Path path (iterator-seq (.iterator dir-stream))
+                     :when (Files/isRegularFile path (make-array LinkOption 0))]
+                 (str (.relativize root-path path)))))))
+
+(deftype FileSystemObjectStore [^Path root-path, ^ExecutorService pool, ^FileCache file-cache]
   ObjectStore
   (getObject [_this k]
     (CompletableFuture/completedFuture
@@ -173,17 +182,10 @@
             (util/write-buffer-to-path buf to-path))))))
 
   (listObjects [_this]
-    (with-open [dir-stream (Files/walk root-path (make-array FileVisitOption 0))]
-      (vec (sort (for [^Path path (iterator-seq (.iterator dir-stream))
-                       :when (Files/isRegularFile path (make-array LinkOption 0))]
-                   (str (.relativize root-path path)))))))
+    (.listFiles file-cache))
 
   (listObjects [_this dir]
-    (let [dir (.resolve root-path dir)]
-      (when (Files/exists dir (make-array LinkOption 0))
-        (with-open [dir-stream (Files/newDirectoryStream dir)]
-          (vec (sort (for [^Path path dir-stream]
-                       (str (.relativize root-path path)))))))))
+    (.listFiles file-cache dir))
 
   (deleteObject [_this k]
     (util/completable-future pool
@@ -205,10 +207,28 @@
 (defmethod ig/pre-init-spec ::file-system-object-store [_]
   (s/keys :req-un [::root-path ::pool-size]))
 
+(defn file-list-init [root-path file-cache]
+  (let [filename-list (list-files-in-path root-path)]
+    (.addFiles file-cache filename-list)))
+
+;; TODO: Make Closeable
+(defn file-list-watch [root-path file-cache]
+  (->> (.toFile root-path)
+       (dirwatch/watch-dir (fn [{:keys [file action]}]
+                             (let [file-name (->> (.toPath file)
+                                                  (.relativize (.toAbsolutePath root-path))
+                                                  (.toString))]
+                               (case action
+                                 :create (.addFile file-cache file-name)
+                                 :delete (.removeFile file-cache file-name)))))))
+
 (defmethod ig/init-key ::file-system-object-store [_ {:keys [root-path pool-size]}]
   (util/mkdirs root-path)
   (let [pool (Executors/newFixedThreadPool pool-size (util/->prefix-thread-factory "file-system-object-store-"))]
-    (->FileSystemObjectStore root-path pool)))
+    (->FileSystemObjectStore root-path 
+                             pool
+                             (file-list/->local-file-cache {:init-fn (partial file-list-init root-path)
+                                                            :watcher-fn (partial file-list-watch root-path)}))))
 
 (defmethod ig/halt-key! ::file-system-object-store [_ ^FileSystemObjectStore os]
   (.close os))
