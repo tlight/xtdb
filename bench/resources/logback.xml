@@ -9,4 +9,5 @@
   </root>
   <logger name="xtdb" level="WARN" />
   <logger name="xtdb.bench" level="INFO" />
+  <logger name="xtdb.bench2" level="INFO" />
 </configuration>
