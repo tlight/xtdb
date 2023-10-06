@@ -287,6 +287,14 @@
                    :gag :gag_id
                    :gav :gav_id})
 
+;; copied from core.clj
+(defn parse-long ^Long [^String s]
+  (if (string? s)
+    (try
+      (Long/valueOf s)
+      (catch NumberFormatException _ nil))
+    (throw (IllegalArgumentException. ""))))
+
 (defn largest-id [node table prefix-length]
   (let [id (->> (xt/q (xt/db node) (assoc `{:find [~'id]
                                             :where [[~'id ~(table->attri table)]]}
@@ -476,53 +484,57 @@
                          threads,
                          duration
                          sync
-                         scale-factor]
+                         scale-factor
+                         load-phase]
                   :or {seed 0,
                        threads 8,
                        duration "PT30S"
                        sync false
-                       scale-factor 0.1}}]
+                       scale-factor 0.1
+                       load-phase true}}]
   (let [duration (Duration/parse duration)
         sf scale-factor]
     {:title "Auction Mark OLTP"
      :seed seed
      :tasks
-     [#_{:t :do
-         :stage :load
-         :tasks [{:t :call, :f (fn [_] (log/info "start of auctionmark data ingestion"))}
-                 {:t :call, :f [bcore1/install-tx-fns {:apply-seller-fee tx-fn-apply-seller-fee, :new-bid tx-fn-new-bid}]}
-                 {:t :call, :f load-categories-tsv}
-                 {:t :call, :f [bcore1/generate generate-region 75]}
-                 {:t :call, :f [bcore1/generate generate-category 16908]}
-                 {:t :call, :f [bcore1/generate generate-global-attribute-group 100]}
-                 {:t :call, :f [bcore1/generate generate-global-attribute-value 1000]}
-                 {:t :call, :f [bcore1/generate generate-user (* sf 1e6)]}
-                 {:t :call, :f [bcore1/generate generate-user-attributes (* sf 1e6 1.3)]}
-                 {:t :call, :f [bcore1/generate generate-item (* sf 1e6 10)]}
-                 {:t :call, :f [(comp xt/sync :sut)]}
-                 {:t :call, :f (fn [_] (log/info "end of auctionmark data ingestion"))}]}
-      {:t :do
-       :stage :setup-worker
-       :tasks [{:t :call, :f (fn [_] (log/info "setting up worker with stats"))}
-               {:t :call, :f load-stats-into-worker}
-               {:t :call, :f log-stats}
-               {:t :call, :f (fn [_] (log/info "finished setting up worker with stats"))}]}
-      {:t :concurrently
-       :stage :oltp
-       :duration duration
-       :join-wait (Duration/ofMinutes 5)
-       :thread-tasks [{:t :pool
-                       :duration duration
-                       :join-wait (Duration/ofMinutes 5)
-                       :thread-count threads
-                       :think Duration/ZERO
-                       :pooled-task {:t :pick-weighted
-                                     :choices [[{:t :call, :transaction :get-item, :f proc-get-item} 12.0]
-                                               [{:t :call, :transaction :new-user, :f proc-new-user} 0.5]
-                                               [{:t :call, :transaction :new-item, :f proc-new-item} 1.0]
-                                               [{:t :call, :transaction :new-bid, :f proc-new-bid} 2.0]]}}
-                      {:t :freq-job
-                       :duration duration
-                       :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
-                       :job-task {:t :call, :transaction :index-item-status-groups, :f index-item-status-groups}}]}
-      (when sync {:t :call, :f #(xt/sync (:sut %))})]}))
+     (into (if load-phase
+             [{:t :do
+               :stage :load
+               :tasks [{:t :call, :f (fn [_] (log/info "start of auctionmark data ingestion"))}
+                       {:t :call, :f [bcore1/install-tx-fns {:apply-seller-fee tx-fn-apply-seller-fee, :new-bid tx-fn-new-bid}]}
+                       {:t :call, :f load-categories-tsv}
+                       {:t :call, :f [bcore1/generate generate-region 75]}
+                       {:t :call, :f [bcore1/generate generate-category 16908]}
+                       {:t :call, :f [bcore1/generate generate-global-attribute-group 100]}
+                       {:t :call, :f [bcore1/generate generate-global-attribute-value 1000]}
+                       {:t :call, :f [bcore1/generate generate-user (* sf 1e6)]}
+                       {:t :call, :f [bcore1/generate generate-user-attributes (* sf 1e6 1.3)]}
+                       {:t :call, :f [bcore1/generate generate-item (* sf 1e6 10)]}
+                       {:t :call, :f [(comp xt/sync :sut)]}
+                       {:t :call, :f (fn [_] (log/info "end of auctionmark data ingestion"))}]}]
+             [])
+           [{:t :do
+             :stage :setup-worker
+             :tasks [{:t :call, :f (fn [_] (log/info "setting up worker with stats"))}
+                     {:t :call, :f load-stats-into-worker}
+                     {:t :call, :f log-stats}
+                     {:t :call, :f (fn [_] (log/info "finished setting up worker with stats"))}]}
+            {:t :concurrently
+             :stage :oltp
+             :duration duration
+             :join-wait (Duration/ofMinutes 5)
+             :thread-tasks [{:t :pool
+                             :duration duration
+                             :join-wait (Duration/ofMinutes 5)
+                             :thread-count threads
+                             :think Duration/ZERO
+                             :pooled-task {:t :pick-weighted
+                                           :choices [[{:t :call, :transaction :get-item, :f proc-get-item} 12.0]
+                                                     [{:t :call, :transaction :new-user, :f proc-new-user} 0.5]
+                                                     [{:t :call, :transaction :new-item, :f proc-new-item} 1.0]
+                                                     [{:t :call, :transaction :new-bid, :f proc-new-bid} 2.0]]}}
+                            {:t :freq-job
+                             :duration duration
+                             :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
+                             :job-task {:t :call, :transaction :index-item-status-groups, :f index-item-status-groups}}]}
+            (when sync {:t :call, :f #(xt/sync (:sut %))})])}))

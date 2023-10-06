@@ -1,29 +1,31 @@
 (ns xtdb.bench2.core1
-  (:require [xtdb.api :as xt]
-            [xtdb.bench2.measurement :as bm]
-            [xtdb.bus :as bus]
-            [xtdb.bench2 :as b2]
-            [xtdb.bench2.tools :as bt]
-            [xtdb.bench2.ec2 :as ec2]
-            [xtdb.io :as xio]
+  (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
-            [clojure.edn :as edn]
+            [clojure.spec.alpha :as s]
             [clojure.string :as str]
+            [clojure.tools.cli :as cli]
+            [clojure.tools.logging :as log]
             [juxt.clojars-mirrors.nippy.v3v1v1.taoensso.nippy :as nippy]
+            [xtdb.api :as xt]
+            [xtdb.bench2 :as b2]
+            [xtdb.bench2.ec2 :as ec2]
+            [xtdb.bench2.measurement :as bm]
+            [xtdb.bench2.tools :as bt]
+            [xtdb.bus :as bus]
+            [xtdb.io :as xio]
             [xtdb.kv :as kv]
-            [xtdb.memory :as mem]
-            [clojure.spec.alpha :as s])
-  (:import (java.time Duration)
-           (java.time Instant Duration Clock)
-           (java.util Random)
-           (java.util.concurrent ConcurrentHashMap)
-           (java.util.concurrent.atomic AtomicLong)
-           (java.io Closeable File DataOutputStream DataInputStream)
-           (java.util Date HashMap ArrayList)
-           (clojure.lang PersistentArrayMap)
+            [xtdb.memory :as mem])
+  (:import (clojure.lang PersistentArrayMap)
+           (io.micrometer.core.instrument MeterRegistry Tag Timer Timer$Sample)
+           (java.io Closeable DataInputStream DataOutputStream File)
            (java.security MessageDigest)
-           (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)))
+           (java.time Duration)
+           (java.time Clock Duration)
+           (java.util Random)
+           (java.util ArrayList Date HashMap)
+           (java.util.concurrent ConcurrentHashMap)
+           (java.util.concurrent.atomic AtomicLong)))
 
 (set! *warn-on-reflection* false)
 
@@ -708,6 +710,47 @@
         reports (atom [])
         worker (b2/->Worker node root-random domain-state custom-state clock reports)]
     worker))
+
+(defn- only-oltp-stage [report]
+  (let [stage-filter #(filter (comp #{:oltp} :stage) %)]
+    (-> report
+        (update :stages stage-filter)
+        (update :metrics stage-filter))))
+
+(defn run-auctionmark [{:keys [output-file node-dir load-phase duration]
+                        :or {node-dir "dev/auctionmark-run" duration "PT30S"} :as opts}]
+  (let [output-file (or output-file (str "auctionmark-" duration ".edn"))
+        node-dir (io/file node-dir)]
+    (when load-phase
+      (io/delete-file node-dir true))
+    (let [report (-> (run-benchmark
+                      {:node-opts {:index :rocks, :log :rocks, :docs :rocks, :node-dir node-dir}
+                       :benchmark-type :auctionmark
+                       :benchmark-opts (assoc opts :sync true)})
+                     only-oltp-stage)]
+      (spit (io/file output-file) report))))
+
+(def cli-options
+  [[nil "--load-phase LOAD-PHASE" :parse-fn #(if (or (= % "false") (= % "nil")) false true)]
+   [nil "--output-file OUTPUT-FILE"]
+   [nil "--node-dir NODE-DIR"]
+   [nil "--duration DURATION" :validate [(fn [x] (try (Duration/parse x)
+                                                      (catch Throwable _t
+                                                        false)
+                                                      (finally true)))
+                                         "Incorrect duration period"]]
+   [nil "--threads THREADS" :parse-fn #(Long/parseLong %)]
+   [nil "--scale-factor" :parse-fn #(Double/parseDouble %)]])
+
+(defn -main [& args]
+  (let [{:keys [options _arguments errors]} (cli/parse-opts args cli-options)]
+    #_(prn options)
+    (if (seq errors)
+      (binding [*out* *err*]
+        (doseq [error errors]
+          (println error))
+        (System/exit 1))
+      (run-auctionmark options))))
 
 (comment
   ;; ======
