@@ -298,7 +298,7 @@
 (defn largest-id [node table prefix-length]
   (let [id (->> (xt/q (xt/db node) (assoc `{:find [~'id]
                                             :where [[~'id ~(table->attri table)]]}
-                                          :timeout 60000))
+                                          :timeout 240000))
                 (sort-by first #(cond (< (count %1) (count %2)) 1
                                       (< (count %2) (count %1)) -1
                                       :else (compare %2 %1)))
