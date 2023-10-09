@@ -47,7 +47,7 @@
                  [com.github.oshi/oshi-core "6.3.0"]]
 
   :resource-paths ["resources" "data"]
-  :jvm-opts ["-Xms3g" "-Xmx3g"]
+  ;; :jvm-opts ["-Xms3g" "-Xmx3g"]
   :uberjar-name "xtdb-bench-standalone.jar"
 
   :profiles {:with-neo4j {:dependencies [[org.neo4j/neo4j "4.0.0"]]
