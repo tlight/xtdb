@@ -1,9 +1,8 @@
 (ns xtdb.xtql.json
   (:require [xtdb.error :as err])
   (:import [java.time Duration LocalDate LocalDateTime ZonedDateTime]
-           (xtdb.query BindingSpec Expr Expr$Bool Expr$Call Expr$Double Expr$Exists Expr$LogicVar Expr$Long Expr$NotExists Expr$Obj Expr$Subquery
-                       Query Query$Aggregate Query$From Query$LeftJoin Query$Join Query$Pipeline Query$OrderBy Query$OrderDirection Query$OrderSpec Query$Return Query$Unify Query$UnionAll Query$Where Query$With Query$Without
-                       TemporalFilter TemporalFilter$AllTime TemporalFilter$At TemporalFilter$In)))
+           [java.util Date]
+           (xtdb.query BindingSpec Expr Expr$Bool Expr$Call Expr$Double Expr$Exists Expr$LogicVar Expr$Long Expr$NotExists Expr$Obj Expr$Subquery Query Query$Aggregate Query$From Query$Join Query$LeftJoin Query$OrderBy Query$OrderDirection Query$OrderSpec Query$Pipeline Query$Return Query$Unify Query$UnionAll Query$Where Query$With Query$Without TemporalFilter TemporalFilter$AllTime TemporalFilter$At TemporalFilter$In)))
 
 (defmulti parse-query
   (fn [query]
@@ -136,6 +135,7 @@
         (string? obj) {"@value" obj}
         (keyword? obj) {"@value" (str (symbol obj)), "@type" "xt:keyword"}
         (set? obj) {"@value" (mapv unparse obj), "@type" "xt:set"}
+        (instance? Date obj) {"@value" (str obj), "@type" "xt:date"}
         (instance? LocalDate obj) {"@value" (str obj), "@type" "xt:date"}
         (instance? Duration obj) {"@value" (str obj), "@type" "xt:duration"}
         (instance? LocalDateTime obj) {"@value" (str obj), "@type" "xt:timestamp"}
