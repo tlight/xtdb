@@ -16,6 +16,11 @@ We'll save the in-depth XTQL specification for another article - for now, let's 
 (from :users {:xt/id user-id} first-name last-name)
 ----
 +
+[source,json]
+----
+{"from" : [ "users", {"xt/id" : "user-id"}, "first-name", "last-name" ]}
+----
++
 [source,sql]
 ----
 SELECT xt$id AS user_id, first_name, last_name FROM users
@@ -26,6 +31,13 @@ SELECT xt$id AS user_id, first_name, last_name FROM users
 [source,clojure]
 ----
 (from :users {:xt/id "james"} first-name last-name)
+----
++
+[source,json]
+----
+{
+  "from" : [ "users", { "xt/id" : { "@value" : "james" } }, "first-name", "last-name" ]
+}
 ----
 +
 [source,sql]
@@ -40,6 +52,21 @@ SELECT first_name, last_name FROM users WHERE xt$id = 'james'
 (-> (from :users {:xt/id user-id} first-name last-name)
     (order-by last-name first-name)
     (limit 10))
+----
++
+[source,json]
+----
+{
+  "->" : [
+    {
+      "from" : [ "users", { "xt/id" : "user-id" }, "first-name", "last-name"]
+    }, {
+      "orderBy" : [ "last-name", "first-name" ]
+    }, {
+      "limit" : 10
+    },
+  ]
+}
 ----
 +
 [source,sql]
@@ -66,6 +93,19 @@ In this case, we re-use the `user-id` logic variable to indicate that the `:xt/i
        (from :articles {:author-id user-id} title content))
 ----
 +
+[source,json]
+----
+{
+  "unify" : [
+    {
+      "from" : [ "users", { "xt/id" : "user-id"}, "first-name", "last-name" ]
+    }, {
+      "from" : [ "articles", { "author-id" : "user-id" }, "title", "content" ]
+    }
+  ]
+}
+----
++
 [source,sql]
 ----
 SELECT u.xt$id AS user_id, first_name, last_name, title, content
@@ -81,6 +121,21 @@ FROM users u JOIN articles a ON u.xt$id = a.author_id
 (unify (from :users {:xt/id uid1} age)
        (from :users {:xt/id uid2} age)
        (where (<> uid1 uid2)))
+----
++
+[source,json]
+----
+{
+  "unify" : [
+    {
+      "from" : [ "users", { "xt/id" : "uid1" }, "age" ]
+    }, {
+      "from" : [ "users", { "xt/id" : "uid2" }, "age" ]
+    }, {
+      "where" : [ { "<>" : [ "uid1", "uid2" ] } ]
+    }
+  ]
+}
 ----
 +
 [source,sql]
@@ -101,6 +156,29 @@ WHERE u1.xt$id <> u2.xt$id
     (limit 100))
 ----
 +
+[source,json]
+----
+{
+  "->" : [
+    {
+      "unify" : [
+        {
+          "from" : [ "customers", { "xt/id" : "cid"} ]
+        }, {
+          "left-join" : [
+            {
+              "from" : [ "orders", { "xt/id" : "oid" }, { "customer-id" : "cid"}, "currency", "order-value" ]
+            },
+            "cid", "currency", "order-value"]
+        }
+      ]
+    }, {
+      "limit" : 100
+    }
+  ]
+}
+----
++
 [source,sql]
 ----
 SELECT c.xt$id AS cid, o.xt$id AS oid, currency, order_value
@@ -117,6 +195,26 @@ Here, we're asking to additionally return customers who haven't yet any orders (
 (-> (unify (from :customers {:xt/id cid})
            (where (not-exists? [(from :orders {:customer-id cid}) cid])))
     (limit 100))
+----
++
+[source,json]
+----
+{
+  "->" : [
+    {
+      "unify" : [
+        { "from" : [ "customers", { "xt/id" : "cid" } ] },
+        {
+          "where" : [
+            { "notExists" : [ { "from" : [ "orders", { "customer-id" : "cid"} ]}, "cid" ] }
+          ]
+        }
+      ]
+    }, {
+      "limit" : 100
+    }
+  ]
+}
 ----
 +
 [source,sql]
@@ -139,6 +237,20 @@ LIMIT 100
     (with {full-name (str first-name " " last-name)}))
 ----
 +
+[source,json]
+----
+{
+  "->" : [
+    { "from" : [ "users", "first-name", "last-name" ]},
+    {
+      "with" : [
+        { "full-name" : { "str" : [ "first-name", { "@value" : " " }, "last-name" ] } }
+      ]
+    }
+  ]
+}
+----
++
 [source,sql]
 ----
 SELECT first_name, last_name,
@@ -157,6 +269,24 @@ We can also use `with` within `unify` - this creates new logic variables which w
     (return {full-name (str first-name " " last-name)} title content))
 ----
 +
+[source,json]
+----
+{
+  "->" : [
+    {
+      "unify" : [
+        { "from" : [ "users", { "xt/id" : "user-id" }, "first-name", "last-name" ]},
+        { "from" : [ "articles", { "author-id" : "user-id" }, "title", "content" ]}
+      ]
+    }, {
+      "return" : [
+        { "full-name" : { "str" : [ "first-name", { "@value" : " " }, "last-name" ] }},
+        "title", "content" ]
+    }
+  ]
+}
+----
++
 [source,sql]
 ----
 SELECT CONCAT(first_name, ' ', last_name) AS full_name, title, content
@@ -169,6 +299,22 @@ FROM users u JOIN articles a ON u.xt$id = a.author_id
 (-> (unify (from :users {:xt/id user-id} first-name last-name)
            (from :articles {:author-id user-id} title content))
     (without user-id))
+----
++
+[source,json]
+----
+{
+  "->" : [
+    {
+      "unify" : [
+        { "from" : [ "users", { "xt/id" : "user-id" }, "first-name", "last-name" ] },
+        { "from" : [ "articles", { "author-id" : "user-id" }, "title", "content" ] }
+      ]
+    }, {
+      "without" : [ "user-id" ]
+    }
+  ]
+}
 ----
 +
 [source,sql]
@@ -192,6 +338,37 @@ To count/sum/average values, we use `aggregate`:
                 total-value (sum order-value)})
     (order-by [order-value {:dir :desc}])
     (limit 100))
+----
+
+[source,json]
+----
+{
+  "->" : [
+    {
+      "unify" : [
+        {
+          "from" : [ "customers", { "xt/id" : "cid" } ]
+        }, {
+          "left-join" : [
+            {
+              "from" : [ "orders", { "xt/id" : "oid" }, { "customer-id" : "cid"}, "currency", "order-value" ]
+            },
+            "cid", "currency", "order-value"]
+        }]
+    }, {
+      "aggregate" : [ "cid", "currency",
+        {
+          "order-count" : { "count*" : [ ] },
+          "total-value" : { "sum" : [ "order-value" ] }
+        }
+      ]
+    }, {
+      "orderBy" : [ [ "order-value", { "dir" : "desc" } ] ]
+    }, {
+      "limit" : 100
+    }
+  ]
+}
 ----
 
 [source,sql]
@@ -235,6 +412,11 @@ For example, if a user is reading an article, we might also want to show them de
 ;; Lots of nested left-joins, array-aggs, and vendor-specific JSON functions required there to guarantee this same output.
 ----
 
+[source,json]
+----
+TODO json
+----
+
 In this example, we use `pull` to pull back a single map - we know that there's only one author per article (in our system).
 When it's a one-to-many relationship, we use `pull*` - this returns any matches in a vector.
 
@@ -260,6 +442,25 @@ In XTQL, while there are sensible defaults set for the whole query, you can over
       first-name last-name)
 ----
 +
+[source,json]
+----
+{
+  "from" : [
+    {
+      "users" : {
+        "forValidTime" : { "at" : { "@value" : "2020-01-01", "@type" : "xt:date" } }
+      }
+    },
+    "first-name", "last-name" ]
+}
+
+{
+  "from" : [
+    { "users" : { "forValidTime" : "allTime" } },
+    "first-name", "last-name" ]
+}
+----
++
 [source,sql]
 ----
 SELECT first_name, last_name FROM users FOR VALID_TIME AT DATE '2020-01-01';
@@ -277,6 +478,32 @@ SELECT first_name, last_name FROM users FOR ALL VALID_TIME;
 
        (from [:users {:for-valid-time [:at #inst "2023"]}]
              {:xt/id user-id}))
+----
++
+[source,json]
+----
+{
+  "unify" : [
+    {
+      "from" : [
+        {
+          "users" : {
+            "forValidTime" : { "at" : { "@value" : "2018-01-01", "@type" : "xt:date" } }
+          }
+        },
+        { "xt/id" : "user-id" } ]
+    }, {
+      "from" : [
+        {
+          "users" : {
+            "forValidTime" : { "at" : { "@value" : "2023-01-01", "@type" : "xt:date" } }
+          }
+        },
+        { "xt/id" : "user-id" }
+      ]
+    }
+  ]
+}
 ----
 
 == Get in touch!
