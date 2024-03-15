@@ -505,8 +505,6 @@ class XtdbConsole(cmd.Cmd):
                                                              basis_at_tx_id=basis_at_tx_id,
                                                              basis_at_system_time=basis_at_system_time)
 
-            print()
-
             if explain:
                 #print('Generated query plan (printed using `edn_format`):')
                 print(result[0]['plan'])
@@ -518,8 +516,6 @@ class XtdbConsole(cmd.Cmd):
                 print(markdownSimpleTable(prepare_for_tabulate(result2)))
             else:
                 pprint.pprint(result)
-
-            print()
 
         except urllib.error.HTTPError as e:
             self.was_error = True
@@ -546,14 +542,13 @@ def main():
     print("Copyright © 2021-2024, JUXT LTD.")
     print()
     print("Type 'help' for commands")
-    print()
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('sql', nargs='*', help='SQL statement or file')
     parser.add_argument('--url', default='http://localhost:3000')
     args = parser.parse_args()
 
-    prompt = 'xtdb-> '
+    prompt = '-> '
     nested_prompt = '.. '
     if not sys.stdin.isatty():
         prompt = ''
